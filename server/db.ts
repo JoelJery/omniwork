@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { User, WorkContext, StatusHistoryItem, WorkEvent, IntegrationStatus, QueuedMessage } from './types.ts';
+import { Pool } from 'pg';
 
 const DB_PATH = path.resolve(process.cwd(), 'omniwork-data.json');
 
@@ -270,278 +271,167 @@ const INITIAL_MESSAGES: QueuedMessage[] = [
 ];
 
 class Database {
-  private data: DatabaseSchema;
-  private storageMode: 'postgres' | 'local-json' = 'local-json';
+  private data: DatabaseSchema = {
+    users: [],
+    workContexts: {},
+    statusHistory: [],
+    workEvents: [],
+    integrations: {},
+    queuedMessages: [],
+  };
+  private storageMode: 'postgres' | 'local-json' = process.env.DATABASE_URL ? 'postgres' : 'local-json';
+  private pool: Pool | null = null;
+  private ready: Promise<void>;
 
   constructor() {
-    this.initDatabaseConfig();
-    this.data = this.load();
-  }
-
-  private initDatabaseConfig() {
     const databaseUrl = process.env.DATABASE_URL;
     const authSecret = process.env.AUTH_SECRET;
-
-    if (databaseUrl && databaseUrl.trim().length > 0) {
-      console.log('[OmniWork DB] DATABASE_URL provided. External database configured:', databaseUrl.split('@')[1] || 'configured');
-      // Graceful note: external DB is supported; falls back seamlessly to internal storage if unmigrated
-      this.storageMode = 'local-json';
+    if (databaseUrl && databaseUrl.trim()) {
+      this.pool = new Pool({
+        connectionString: databaseUrl,
+        ssl: { rejectUnauthorized: false },
+        max: 5,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+      });
+      console.log('[OmniWork DB] PostgreSQL/Supabase configured.');
+      this.ready = this.initializePostgres();
     } else {
+      this.storageMode = 'local-json';
       console.log('[OmniWork DB] Running in standalone development/demo mode with persistent local JSON storage.');
+      this.ready = Promise.resolve().then(() => { this.data = this.loadLocal(); });
     }
-
-    if (!authSecret) {
-      console.log('[OmniWork Auth] AUTH_SECRET not provided, using development fallback secret.');
-    }
+    if (!authSecret) console.log('[OmniWork Auth] AUTH_SECRET not provided, using development fallback secret.');
   }
 
-  private load(): DatabaseSchema {
+  private loadLocal(): DatabaseSchema {
     try {
-      if (fs.existsSync(DB_PATH)) {
-        const raw = fs.readFileSync(DB_PATH, 'utf-8');
-        return JSON.parse(raw);
-      }
+      if (fs.existsSync(DB_PATH)) return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'));
     } catch (e) {
       console.warn('Could not read existing database file, initializing defaults:', e);
     }
-
-    const initial: DatabaseSchema = {
-      users: INITIAL_USERS,
-      workContexts: INITIAL_WORK_CONTEXTS,
-      statusHistory: [
-        {
-          id: 'hist-1',
-          user_id: 'user-me',
-          status: 'Available',
-          message: 'Free for a quick discussion or questions.',
-          created_at: new Date(Date.now() - 120 * 60000).toISOString(),
-        },
-      ],
-      workEvents: INITIAL_WORK_EVENTS,
-      integrations: {
-        'user-me': INITIAL_INTEGRATIONS,
-      },
-      queuedMessages: INITIAL_MESSAGES,
-    };
-    this.save(initial);
+    const initial = this.initialData();
+    this.saveLocal(initial);
     return initial;
   }
 
-  private save(dataToSave?: DatabaseSchema) {
-    try {
-      const data = dataToSave || this.data;
-      fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), 'utf-8');
-    } catch (err) {
-      // In read-only container environments, log warning instead of crashing
-      console.warn('Notice: Local database file not writable, keeping state in-memory:', (err as any)?.message || err);
-    }
-  }
-
-  public getStorageInfo() {
+  private initialData(): DatabaseSchema {
     return {
-      mode: this.storageMode,
-      databaseUrlConfigured: Boolean(process.env.DATABASE_URL),
-      authSecretConfigured: Boolean(process.env.AUTH_SECRET),
-      persistentFile: DB_PATH,
+      users: INITIAL_USERS.map(u => ({ ...u, skills: [...u.skills] })),
+      workContexts: Object.fromEntries(Object.entries(INITIAL_WORK_CONTEXTS).map(([k,v]) => [k, {...v}])),
+      statusHistory: [{ id:'hist-1', user_id:'user-me', status:'Available', message:'Free for a quick discussion or questions.', created_at:new Date().toISOString() }],
+      workEvents: INITIAL_WORK_EVENTS.map(e => ({...e})),
+      integrations: { 'user-me': INITIAL_INTEGRATIONS.map(i => ({...i})) },
+      queuedMessages: INITIAL_MESSAGES.map(m => ({...m})),
     };
   }
 
-  // Users
-  getUsers(): User[] {
-    return this.data.users;
+  private saveLocal(dataToSave?: DatabaseSchema) {
+    try { fs.writeFileSync(DB_PATH, JSON.stringify(dataToSave || this.data, null, 2), 'utf-8'); }
+    catch (err) { console.warn('Notice: Local database file not writable, keeping state in-memory:', (err as any)?.message || err); }
   }
 
-  getUser(id: string): User | undefined {
-    return this.data.users.find(u => u.id === id);
+  private async initializePostgres() {
+    const pool = this.pool!;
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, role TEXT NOT NULL,
+        avatar_url TEXT NOT NULL, skills TEXT[] NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS work_contexts (
+        id TEXT PRIMARY KEY, user_id TEXT UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('Focus','Available','Away')), project TEXT NOT NULL DEFAULT '',
+        task TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT '', interrupt_for TEXT NOT NULL DEFAULT '',
+        expires_at TEXT, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS status_history (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL, message TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS work_events (
+        id TEXT PRIMARY KEY, team_id TEXT NOT NULL, source TEXT NOT NULL, category TEXT NOT NULL,
+        title TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', project TEXT NOT NULL DEFAULT '', target_user TEXT,
+        action_required BOOLEAN NOT NULL DEFAULT FALSE, time_display TEXT NOT NULL DEFAULT 'Just now', created_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS integrations (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, name TEXT NOT NULL,
+        icon TEXT NOT NULL, connected BOOLEAN NOT NULL DEFAULT FALSE, last_synced_status TEXT, last_synced_at TEXT,
+        PRIMARY KEY (user_id, id)
+      );
+      CREATE TABLE IF NOT EXISTS queued_messages (
+        id TEXT PRIMARY KEY, sender_id TEXT NOT NULL, sender_name TEXT NOT NULL, sender_avatar TEXT NOT NULL,
+        recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, recipient_name TEXT NOT NULL,
+        urgency TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, read BOOLEAN NOT NULL DEFAULT FALSE
+      );
+    `);
+    const count = Number((await pool.query('SELECT COUNT(*)::int AS count FROM users')).rows[0].count);
+    if (count === 0) await this.seedPostgres();
   }
 
-  getUserByEmail(email: string): User | undefined {
-    return this.data.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+  private async seedPostgres() {
+    const p = this.pool!;
+    const client = await p.connect();
+    try {
+      await client.query('BEGIN');
+      for (const u of INITIAL_USERS) await client.query(`INSERT INTO users(id,name,email,role,avatar_url,skills,created_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, [u.id,u.name,u.email,u.role,u.avatar_url,u.skills,u.created_at]);
+      for (const c of Object.values(INITIAL_WORK_CONTEXTS)) await client.query(`INSERT INTO work_contexts(id,user_id,status,project,task,message,interrupt_for,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`, [c.id,c.user_id,c.status,c.project,c.task,c.message,c.interrupt_for,c.expires_at,c.created_at,c.updated_at]);
+      for (const h of [{id:'hist-1',user_id:'user-me',status:'Available',message:'Free for a quick discussion or questions.',created_at:new Date().toISOString()}]) await client.query(`INSERT INTO status_history(id,user_id,status,message,created_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [h.id,h.user_id,h.status,h.message,h.created_at]);
+      for (const e of INITIAL_WORK_EVENTS) await client.query(`INSERT INTO work_events(id,team_id,source,category,title,detail,project,target_user,action_required,time_display,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`, [e.id,e.team_id,e.source,e.category,e.title,e.detail,e.project,e.target_user || null,e.action_required,e.time_display,e.created_at]);
+      for (const i of INITIAL_INTEGRATIONS) await client.query(`INSERT INTO integrations(user_id,id,name,icon,connected,last_synced_status,last_synced_at) VALUES('user-me',$1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, [i.id,i.name,i.icon,i.connected,i.lastSyncedStatus || null,i.lastSyncedAt || null]);
+      for (const m of INITIAL_MESSAGES) await client.query(`INSERT INTO queued_messages(id,sender_id,sender_name,sender_avatar,recipient_id,recipient_name,urgency,body,created_at,read) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`, [m.id,m.sender_id,m.sender_name,m.sender_avatar,m.recipient_id,m.recipient_name,m.urgency,m.body,m.created_at,m.read]);
+      await client.query('COMMIT');
+    } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
   }
 
-  updateUser(id: string, updates: Partial<User>): User | undefined {
-    const userIndex = this.data.users.findIndex(u => u.id === id);
-    if (userIndex === -1) return undefined;
+  public getStorageInfo() { return { mode:this.storageMode, databaseUrlConfigured:Boolean(process.env.DATABASE_URL), authSecretConfigured:Boolean(process.env.AUTH_SECRET), persistentFile:DB_PATH }; }
 
-    const existingUser = this.data.users[userIndex];
-    const updatedUser = {
-      ...existingUser,
-      ...updates,
-      id: existingUser.id, // preserve immutable ID
-    };
-    this.data.users[userIndex] = updatedUser;
-    this.save();
-    return updatedUser;
+  async getUsers(): Promise<User[]> {
+    await this.ready;
+    if (!this.pool) return this.data.users;
+    const r=await this.pool.query('SELECT id,name,email,role,avatar_url,skills,created_at FROM users ORDER BY created_at');
+    return r.rows.map(this.userRow);
   }
-
-  createUser(user: User): User {
-    this.data.users.push(user);
-    // Initialize default context
-    this.data.workContexts[user.id] = {
-      id: `ctx-${user.id}`,
-      user_id: user.id,
-      status: 'Available',
-      project: 'General',
-      task: 'Open for collaboration',
-      message: 'Available for questions or quick syncs.',
-      interrupt_for: 'Any questions or collaboration',
-      expires_at: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    this.data.integrations[user.id] = INITIAL_INTEGRATIONS.map(i => ({ ...i }));
-    this.save();
+  async getUser(id:string):Promise<User|undefined>{ const users=await this.getUsers(); return users.find(u=>u.id===id); }
+  async getUserByEmail(email:string):Promise<User|undefined>{ const users=await this.getUsers(); return users.find(u=>u.email.toLowerCase()===email.toLowerCase()); }
+  async updateUser(id:string, updates:Partial<User>):Promise<User|undefined>{
+    await this.ready; const existing=await this.getUser(id); if(!existing)return;
+    const u={...existing,...updates,id:existing.id};
+    if(!this.pool){ const idx=this.data.users.findIndex(x=>x.id===id); this.data.users[idx]=u; this.saveLocal(); return u; }
+    await this.pool.query('UPDATE users SET name=$1,role=$2,avatar_url=$3,skills=$4 WHERE id=$5',[u.name,u.role,u.avatar_url,u.skills,id]); return u;
+  }
+  async createUser(user:User):Promise<User>{
+    await this.ready;
+    if(!this.pool){ this.data.users.push(user); this.data.workContexts[user.id]=this.defaultContext(user.id); this.data.integrations[user.id]=INITIAL_INTEGRATIONS.map(i=>({...i})); this.saveLocal(); return user; }
+    await this.pool.query('INSERT INTO users(id,name,email,role,avatar_url,skills,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)',[user.id,user.name,user.email,user.role,user.avatar_url,user.skills,user.created_at]);
+    const c=this.defaultContext(user.id); await this.pool.query('INSERT INTO work_contexts(id,user_id,status,project,task,message,interrupt_for,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[c.id,c.user_id,c.status,c.project,c.task,c.message,c.interrupt_for,c.expires_at,c.created_at,c.updated_at]);
+    for(const i of INITIAL_INTEGRATIONS) await this.pool.query('INSERT INTO integrations(user_id,id,name,icon,connected,last_synced_status,last_synced_at) VALUES($1,$2,$3,$4,$5,$6,$7)',[user.id,i.id,i.name,i.icon,i.connected,i.lastSyncedStatus||null,i.lastSyncedAt||null]);
     return user;
   }
+  private defaultContext(userId:string):WorkContext{return {id:`ctx-${userId}`,user_id:userId,status:'Available',project:'General',task:'Open for collaboration',message:'Available for questions or quick syncs.',interrupt_for:'Any questions or collaboration',expires_at:null,created_at:new Date().toISOString(),updated_at:new Date().toISOString()};}
 
-  // Work Context & Status
-  getWorkContext(userId: string): WorkContext | undefined {
-    return this.data.workContexts[userId];
+  async getWorkContext(userId:string):Promise<WorkContext|undefined>{await this.ready;if(!this.pool)return this.data.workContexts[userId];const r=await this.pool.query('SELECT * FROM work_contexts WHERE user_id=$1',[userId]);return r.rows[0]?this.contextRow(r.rows[0]):undefined;}
+  async getAllWorkContexts():Promise<Record<string,WorkContext>>{await this.ready;if(!this.pool)return this.data.workContexts;const r=await this.pool.query('SELECT * FROM work_contexts');return Object.fromEntries(r.rows.map(x=>[x.user_id,this.contextRow(x)]));}
+  async updateWorkContext(userId:string, update:Partial<WorkContext>):Promise<WorkContext>{
+    await this.ready; const existing=await this.getWorkContext(userId)||this.defaultContext(userId); const updated={...existing,...update,updated_at:new Date().toISOString()};
+    if(!this.pool){this.data.workContexts[userId]=updated;this.data.statusHistory.unshift({id:`hist-${Date.now()}`,user_id:userId,status:updated.status,message:updated.message||`${updated.status} mode`,created_at:new Date().toISOString()});const integrations=this.data.integrations[userId]||INITIAL_INTEGRATIONS;this.data.integrations[userId]=integrations.map(i=>i.id==='slack'?{...i,lastSyncedStatus:`${updated.status}${updated.project?` — Working on ${updated.project}`:''}`,lastSyncedAt:'Just now'}:i);this.saveLocal();return updated;}
+    await this.pool.query('INSERT INTO work_contexts(id,user_id,status,project,task,message,interrupt_for,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(user_id) DO UPDATE SET status=EXCLUDED.status,project=EXCLUDED.project,task=EXCLUDED.task,message=EXCLUDED.message,interrupt_for=EXCLUDED.interrupt_for,expires_at=EXCLUDED.expires_at,updated_at=EXCLUDED.updated_at',[updated.id,userId,updated.status,updated.project,updated.task,updated.message,updated.interrupt_for,updated.expires_at,updated.created_at,updated.updated_at]);
+    await this.pool.query('INSERT INTO status_history(id,user_id,status,message,created_at) VALUES($1,$2,$3,$4,$5)',[`hist-${Date.now()}-${Math.random().toString(36).slice(2)}`,userId,updated.status,updated.message||`${updated.status} mode`,new Date().toISOString()]);
+    await this.pool.query("UPDATE integrations SET last_synced_status=$1,last_synced_at='Just now' WHERE user_id=$2 AND id='slack'",[`${updated.status}${updated.project?` — Working on ${updated.project}`:''}`,userId]); return updated;
   }
+  async getStatusHistory(userId?:string):Promise<StatusHistoryItem[]>{await this.ready;if(!this.pool){return userId?this.data.statusHistory.filter(h=>h.user_id===userId).slice(0,20):this.data.statusHistory.slice(0,30);}const r=userId?await this.pool.query('SELECT * FROM status_history WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20',[userId]):await this.pool.query('SELECT * FROM status_history ORDER BY created_at DESC LIMIT 30');return r.rows.map(x=>({id:x.id,user_id:x.user_id,status:x.status,message:x.message,created_at:new Date(x.created_at).toISOString()}));}
+  async getWorkEvents():Promise<WorkEvent[]>{await this.ready;if(!this.pool)return this.data.workEvents;const r=await this.pool.query('SELECT * FROM work_events ORDER BY created_at DESC');return r.rows.map(this.eventRow);}
+  async addWorkEvent(event:Omit<WorkEvent,'id'|'created_at'>):Promise<WorkEvent>{await this.ready;const full={...event,id:`evt-${Date.now()}-${Math.random().toString(36).slice(2)}`,created_at:new Date().toISOString()};if(!this.pool){this.data.workEvents.unshift(full);this.saveLocal();return full;}await this.pool.query('INSERT INTO work_events(id,team_id,source,category,title,detail,project,target_user,action_required,time_display,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',[full.id,full.team_id,full.source,full.category,full.title,full.detail,full.project,full.target_user||null,full.action_required,full.time_display,full.created_at]);return full;}
+  async getIntegrations(userId:string):Promise<IntegrationStatus[]>{await this.ready;if(!this.pool)return this.data.integrations[userId]||INITIAL_INTEGRATIONS;const r=await this.pool.query('SELECT id,name,icon,connected,last_synced_status,last_synced_at FROM integrations WHERE user_id=$1 ORDER BY id',[userId]);return r.rows.map((x:any)=>({id:x.id,name:x.name,icon:x.icon,connected:x.connected,lastSyncedStatus:x.last_synced_status||undefined,lastSyncedAt:x.last_synced_at||undefined}));}
+  async toggleIntegration(userId:string,integrationId:string):Promise<IntegrationStatus[]>{await this.ready;const list=await this.getIntegrations(userId);const item=list.find(i=>i.id===integrationId);if(item){item.connected=!item.connected;item.lastSyncedAt='Just now';}if(!this.pool){this.data.integrations[userId]=list;this.saveLocal();return list;}await this.pool.query('UPDATE integrations SET connected=$1,last_synced_at=$2 WHERE user_id=$3 AND id=$4',[item?.connected||false,'Just now',userId,integrationId]);return this.getIntegrations(userId);}
+  async getQueuedMessages(userId:string):Promise<QueuedMessage[]>{await this.ready;if(!this.pool)return this.data.queuedMessages.filter(m=>m.recipient_id===userId);const r=await this.pool.query('SELECT * FROM queued_messages WHERE recipient_id=$1 ORDER BY created_at DESC',[userId]);return r.rows.map(this.messageRow);}
+  async addQueuedMessage(message:Omit<QueuedMessage,'id'|'created_at'|'read'>):Promise<QueuedMessage>{await this.ready;const full={...message,id:`msg-${Date.now()}-${Math.random().toString(36).slice(2)}`,created_at:new Date().toISOString(),read:false};if(!this.pool){this.data.queuedMessages.unshift(full);this.saveLocal();return full;}await this.pool.query('INSERT INTO queued_messages(id,sender_id,sender_name,sender_avatar,recipient_id,recipient_name,urgency,body,created_at,read) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[full.id,full.sender_id,full.sender_name,full.sender_avatar,full.recipient_id,full.recipient_name,full.urgency,full.body,full.created_at,full.read]);return full;}
+  async markMessagesRead(userId:string){await this.ready;if(!this.pool){this.data.queuedMessages=this.data.queuedMessages.map(m=>m.recipient_id===userId?{...m,read:true}:m);this.saveLocal();return;}await this.pool.query('UPDATE queued_messages SET read=true WHERE recipient_id=$1',[userId]);}
+  async resetDemoData(){await this.ready;if(!this.pool){this.data=this.initialData();this.saveLocal();return true;}const p=this.pool;await p.query('TRUNCATE queued_messages, integrations, work_events, status_history, work_contexts, users CASCADE');await this.seedPostgres();return true;}
 
-  getAllWorkContexts(): Record<string, WorkContext> {
-    return this.data.workContexts;
-  }
-
-  updateWorkContext(userId: string, update: Partial<WorkContext>): WorkContext {
-    const existing = this.data.workContexts[userId] || {
-      id: `ctx-${userId}`,
-      user_id: userId,
-      status: 'Available',
-      project: 'General',
-      task: '',
-      message: '',
-      interrupt_for: '',
-      expires_at: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-
-    const updated: WorkContext = {
-      ...existing,
-      ...update,
-      updated_at: new Date().toISOString(),
-    };
-
-    this.data.workContexts[userId] = updated;
-
-    // Log history
-    this.data.statusHistory.unshift({
-      id: `hist-${Date.now()}`,
-      user_id: userId,
-      status: updated.status,
-      message: updated.message || `${updated.status} mode`,
-      created_at: new Date().toISOString(),
-    });
-
-    // Update synced integration status
-    const integrations = this.data.integrations[userId] || INITIAL_INTEGRATIONS;
-    this.data.integrations[userId] = integrations.map(i => {
-      if (i.id === 'slack') {
-        const taskText = updated.project ? ` — Working on ${updated.project}` : '';
-        return {
-          ...i,
-          lastSyncedStatus: `${updated.status}${taskText}`,
-          lastSyncedAt: 'Just now',
-        };
-      }
-      return i;
-    });
-
-    this.save();
-    return updated;
-  }
-
-  getStatusHistory(userId?: string): StatusHistoryItem[] {
-    if (userId) {
-      return this.data.statusHistory.filter(h => h.user_id === userId).slice(0, 20);
-    }
-    return this.data.statusHistory.slice(0, 30);
-  }
-
-  // Work Events
-  getWorkEvents(): WorkEvent[] {
-    return this.data.workEvents;
-  }
-
-  addWorkEvent(event: Omit<WorkEvent, 'id' | 'created_at'>): WorkEvent {
-    const fullEvent: WorkEvent = {
-      ...event,
-      id: `evt-${Date.now()}`,
-      created_at: new Date().toISOString(),
-    };
-    this.data.workEvents.unshift(fullEvent);
-    this.save();
-    return fullEvent;
-  }
-
-  // Integrations
-  getIntegrations(userId: string): IntegrationStatus[] {
-    return this.data.integrations[userId] || INITIAL_INTEGRATIONS;
-  }
-
-  toggleIntegration(userId: string, integrationId: string): IntegrationStatus[] {
-    const list = this.data.integrations[userId] || [...INITIAL_INTEGRATIONS];
-    this.data.integrations[userId] = list.map(item => {
-      if (item.id === integrationId) {
-        return { ...item, connected: !item.connected, lastSyncedAt: 'Just now' };
-      }
-      return item;
-    });
-    this.save();
-    return this.data.integrations[userId];
-  }
-
-  // Queued Messages
-  getQueuedMessages(userId: string): QueuedMessage[] {
-    return this.data.queuedMessages.filter(m => m.recipient_id === userId);
-  }
-
-  addQueuedMessage(message: Omit<QueuedMessage, 'id' | 'created_at' | 'read'>): QueuedMessage {
-    const full: QueuedMessage = {
-      ...message,
-      id: `msg-${Date.now()}`,
-      created_at: new Date().toISOString(),
-      read: false,
-    };
-    this.data.queuedMessages.unshift(full);
-    this.save();
-    return full;
-  }
-
-  markMessagesRead(userId: string) {
-    this.data.queuedMessages = this.data.queuedMessages.map(m => {
-      if (m.recipient_id === userId) {
-        return { ...m, read: true };
-      }
-      return m;
-    });
-    this.save();
-  }
-
-  // Reset to initial demo state
-  resetDemoData() {
-    this.data = {
-      users: INITIAL_USERS,
-      workContexts: { ...INITIAL_WORK_CONTEXTS },
-      statusHistory: [
-        {
-          id: 'hist-1',
-          user_id: 'user-me',
-          status: 'Available',
-          message: 'Free for a quick discussion or questions.',
-          created_at: new Date().toISOString(),
-        },
-      ],
-      workEvents: [...INITIAL_WORK_EVENTS],
-      integrations: {
-        'user-me': [...INITIAL_INTEGRATIONS],
-      },
-      queuedMessages: [...INITIAL_MESSAGES],
-    };
-    this.save();
-    return true;
-  }
+  private userRow=(x:any):User=>({id:x.id,name:x.name,email:x.email,role:x.role,avatar_url:x.avatar_url,skills:x.skills||[],created_at:new Date(x.created_at).toISOString()});
+  private contextRow=(x:any):WorkContext=>({id:x.id,user_id:x.user_id,status:x.status,project:x.project,task:x.task,message:x.message,interrupt_for:x.interrupt_for,expires_at:x.expires_at,created_at:new Date(x.created_at).toISOString(),updated_at:new Date(x.updated_at).toISOString()});
+  private eventRow=(x:any):WorkEvent=>({id:x.id,team_id:x.team_id,source:x.source,category:x.category,title:x.title,detail:x.detail,project:x.project,target_user:x.target_user||undefined,action_required:x.action_required,time_display:x.time_display,created_at:new Date(x.created_at).toISOString()});
+  private messageRow=(x:any):QueuedMessage=>({id:x.id,sender_id:x.sender_id,sender_name:x.sender_name,sender_avatar:x.sender_avatar,recipient_id:x.recipient_id,recipient_name:x.recipient_name,urgency:x.urgency,body:x.body,created_at:new Date(x.created_at).toISOString(),read:x.read});
 }
 
 export const db = new Database();

@@ -76,8 +76,8 @@ async function handleInterruptionEvaluation(req: any, res: any) {
   let expiresAt = providedExpires || null;
 
   if (teammateId) {
-    const teammate = db.getUser(teammateId);
-    const ctx = db.getWorkContext(teammateId);
+    const teammate = await db.getUser(teammateId);
+    const ctx = await db.getWorkContext(teammateId);
     if (teammate) teammateName = teammate.name;
     if (ctx) {
       status = ctx.status;
@@ -116,8 +116,8 @@ router.post('/generate-message', async (req, res) => {
   let recipientTask = '';
 
   if (recipientId) {
-    const user = db.getUser(recipientId);
-    const ctx = db.getWorkContext(recipientId);
+    const user = await db.getUser(recipientId);
+    const ctx = await db.getWorkContext(recipientId);
     if (user) recipientName = user.name;
     if (ctx) {
       recipientStatus = ctx.status;
@@ -143,8 +143,8 @@ router.post('/ask-omni', async (req, res) => {
     return res.status(400).json({ error: 'question is required' });
   }
 
-  const users = db.getUsers();
-  const contexts = db.getAllWorkContexts();
+  const users = await db.getUsers();
+  const contexts = await db.getAllWorkContexts();
 
   const teamData = users.map(u => {
     const ctx = contexts[u.id];
@@ -172,8 +172,8 @@ router.post('/team-recommendation', async (req, res) => {
     return res.status(400).json({ error: 'skillOrTopic is required' });
   }
 
-  const users = db.getUsers();
-  const contexts = db.getAllWorkContexts();
+  const users = await db.getUsers();
+  const contexts = await db.getAllWorkContexts();
 
   const query = skillOrTopic.toLowerCase();
   const matches = users
@@ -214,8 +214,8 @@ router.post('/team-recommendation', async (req, res) => {
 
 // 7. Team Summary
 router.get('/team-summary', async (req, res) => {
-  const users = db.getUsers();
-  const contexts = db.getAllWorkContexts();
+  const users = await db.getUsers();
+  const contexts = await db.getAllWorkContexts();
   const teamData = users.map(u => {
     const ctx = contexts[u.id];
     return {
@@ -232,7 +232,7 @@ router.get('/team-summary', async (req, res) => {
 
 // 8. Generate Brief
 router.post('/generate-brief', async (req, res) => {
-  const events = db.getWorkEvents();
+  const events = await db.getWorkEvents();
   const brief = await generateCatchUpBrief(events, req.body.project);
   res.json(brief);
 });
@@ -240,7 +240,7 @@ router.post('/generate-brief', async (req, res) => {
 // 9. Explain Why
 router.post('/explain-why', async (req, res) => {
   const { eventTitle } = req.body;
-  const events = db.getWorkEvents();
+  const events = await db.getWorkEvents();
   const explanation = await explainWhy(eventTitle || 'Checkout launch moved to Monday', events);
   res.json(explanation);
 });

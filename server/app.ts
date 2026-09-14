@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { Express } from 'express';
 import { db } from './db.ts';
 import authRoutes from './routes/auth.ts';
@@ -10,6 +11,15 @@ import aiRoutes from './routes/ai.ts';
 
 export function createApp(): Express {
   const app = express();
+
+  app.use((req, res, next) => {
+    const origin = process.env.CORS_ORIGIN || '*';
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-user-id');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
 
   app.use(express.json());
 

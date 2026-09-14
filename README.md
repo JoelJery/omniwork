@@ -1,120 +1,41 @@
 # OmniWork
 
-**Know before you interrupt. Stay informed when you’re not.**
+OmniWork is a React/Vite interruption-awareness workspace with an optional Express + PostgreSQL backend.
 
-OmniWork is a privacy-first coordination layer for remote and hybrid teams. It helps teams understand when someone is available, whether an interruption is appropriate, and what important work was missed while they were away or focused.
+## GitHub Pages
 
-Built for **REVIVE NIGHT 2026 – A Start-Up Revival Hackathon**.
+The repository is configured for GitHub Pages. The production frontend includes a local demo data layer, so the published site remains functional even when no backend is configured. Changes are persisted in the browser's local storage.
 
----
+The Pages workflow is `.github/workflows/deploy-pages.yml`.
 
-## The Problem
+The project Pages URL for `JoelJery/omniwork` is:
+`https://joeljery.github.io/omniwork/`
 
-Remote teams do not struggle because they cannot communicate.
+## Optional production API
 
-They struggle because they communicate constantly.
+Set `VITE_API_URL` at build time to an HTTPS deployment of the Express API. When the API is reachable, the frontend uses it; when it is unavailable, it automatically falls back to the browser demo layer.
 
-Employees often do not know:
+The included `render.yaml` can deploy the API to Render. Configure these server environment variables there:
+- `DATABASE_URL`
+- `AUTH_SECRET`
+- `GEMINI_API_KEY`
+- `CORS_ORIGIN` (the exact GitHub Pages origin)
 
-- whether a teammate is available
-- whether an interruption is appropriate
-- what important updates they missed while focusing or away
+## Local development
 
-Existing tools can also create pressure to remain continuously available, while passive activity tracking can feel like surveillance.
+```bash
+npm install
+npm run dev
+```
 
----
+For the API as a standalone service:
 
-## Our Revival
+```bash
+npm run start
+```
 
-The original OmniWork attempted to recreate the physical office digitally through persistent virtual presence.
+## Supabase
 
-Our revival takes a different approach.
+The API supports PostgreSQL/Supabase through `DATABASE_URL`. The schema is in `supabase/schema.sql`, and the server can create the tables automatically on first connection.
 
-Instead of asking:
-
-> Where is everyone?
-
-OmniWork asks:
-
-> Can I contact them right now, and what do I need to know?
-
-Our core principle is:
-
-**Awareness without surveillance.**
-
----
-
-## Core Features
-
-### Intelligent Availability
-
-Users explicitly control their status:
-
-- Available
-- Focus
-- Away
-
-They can also declare:
-
-- what they are working on
-- how long they will be unavailable
-- what situations justify an interruption
-
-OmniWork relies on user-declared context instead of hidden activity tracking.
-
-### Smart Interruption
-
-Before contacting someone, OmniWork checks their status and interruption preferences.
-
-Simple cases are handled using deterministic rules.
-
-AI is only used when the meaning of a request is ambiguous.
-
-The user always remains in control.
-
-### Smart Catch-Up
-
-When a user returns from Focus or Away mode, OmniWork filters relevant workplace events and generates a concise catch-up briefing.
-
-The system prioritizes:
-
-- blockers
-- decisions
-- actions requiring attention
-- relevant updates
-
-Users can also inspect the context behind important decisions.
-
-### Privacy-First Design
-
-OmniWork does not monitor:
-
-- keyboard activity
-- mouse activity
-- webcam
-- microphone
-- screen activity
-- hidden productivity metrics
-
-Only authorized workplace information and user-declared context are used.
-
----
-
-## Architecture
-
-OmniWork follows a retrieval-first architecture:
-
-```text
-User-declared work context
-        +
-Integration / workplace events
-        ↓
-Permission-aware event store
-        ↓
-Database queries + deterministic rules
-        ↓
-Small relevant context set
-        ↓
-Selective AI
-        ↓
-Interruption recommendation / Catch-Up / Explanation
+Never commit `.env`, database passwords, `AUTH_SECRET`, or Gemini keys.
